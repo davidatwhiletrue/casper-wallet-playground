@@ -6,28 +6,8 @@ import React, {
   useState
 } from 'react';
 
-let CasperWalletEventTypes;
-type CasperWalletState = {
-  isLocked: boolean;
-  isConnected: boolean;
-  activeKey: string | null;
-};
-
-let casperWalletInstance;
-const getCasperWalletInstance = () => {
-  try {
-    if (casperWalletInstance == null) {
-      casperWalletInstance = (window as any).CasperWalletProvider();
-    }
-    return casperWalletInstance;
-  } catch (err) {}
-  throw Error('Please install the Casper Wallet Extension.');
-};
-
-const WALLET_STORAGE_KEY = 'cspr-redux-wallet-sync';
-type WalletStorageState = {
-  publicKey: string | null;
-};
+import type { AccountType, ICSPRClickSDK, SignResult } from '@make-software/csprclick-core-types';
+import { loadClickSDK } from './csprclick';
 
 export type SignTypedDataParams = {
   typedData: {
@@ -64,6 +44,10 @@ export type SignTypedDataResult = {
 
 type WalletService = {
   logs: [string, object][];
+  sdkReady: boolean;
+  sdkError: string | null;
+  activeProvider: string | null;
+  signOut: () => Promise<void>;
   log: (msg: string, payload?: any) => void;
   activePublicKey: string | null;
   connect: () => Promise<boolean>;
@@ -109,275 +93,141 @@ export const useWalletService = () => {
   return useContext(walletServiceContext);
 };
 
-export const WalletServiceProvider = props => {
+// Adapt CSPR.click's nullable responses to the existing scenario handlers.
+export function normalizeSignResult(result: SignResult | undefined):
+  { cancelled: true; message?: string } | { cancelled: false; signature: Uint8Array } {
+  if (result?.error) throw new Error(result.error);
+  if (result?.cancelled) return { cancelled: true };
+  if (!result?.signature) throw new Error('CSPR.click returned no signature.');
+  return { cancelled: false, signature: result.signature };
+}
+
+export const WalletServiceProvider = ({ children }: React.PropsWithChildren<{}>) => {
   const [logs, setLogs] = useState<[string, object][]>([]);
-  const log = (msg: string, payload?: any) =>
-    setLogs(state => [[msg, payload], ...state]);
-
-  const [counter, setCounter] = useState(0);
-  const [extensionLoaded, setExtensionLoaded] = useState(false);
+  const log = useCallback((msg: string, payload?: any) =>
+    setLogs(state => [[msg, payload], ...state]), []);
+  const [sdk, setSDK] = useState<ICSPRClickSDK | null>(null);
+  const [sdkError, setSDKError] = useState<string | null>(null);
+  const [account, setAccount] = useState<AccountType | null>(null);
 
   useEffect(() => {
-    let timer;
-    if ((window as any).CasperWalletEventTypes != null) {
-      CasperWalletEventTypes = (window as any).CasperWalletEventTypes;
-      setExtensionLoaded(true);
-      clearTimeout(timer);
-    } else {
-      timer = setTimeout(() => {
-        setCounter(i => (i = 1));
-      }, 500);
-    }
-
+    let disposed = false;
+    let unsubscribe = () => {};
+    loadClickSDK().then(click => {
+      if (disposed) return;
+      const syncAccount = () => setAccount(click.getActiveAccount() || null);
+      const onAccount = (event: { account: AccountType }) => {
+        log('event:account', event.account);
+        setAccount(event.account);
+      };
+      const onSignedOut = () => {
+        log('event:signed_out');
+        setAccount(null);
+      };
+      const onDisconnected = (event: { provider: string }) => {
+        log('event:disconnected', event);
+        // A background provider disconnection must not clear another session.
+        setAccount(current => current?.provider === event.provider ? null : current);
+      };
+      const onUnsolicitedChange = (event: { account: AccountType }) => {
+        // Follow external changes only for the provider of the active session.
+        if (click.getActiveAccount()?.provider !== event.account.provider) return;
+        click.signInWithAccount(event.account).catch(error => {
+          log('Account change failed', { error: String(error) });
+          syncAccount();
+        });
+      };
+      const listeners: [string, (...args: any[]) => void][] = [
+        ['csprclick:signed_in', onAccount],
+        ['csprclick:switched_account', onAccount],
+        ['csprclick:signed_out', onSignedOut],
+        ['csprclick:disconnected', onDisconnected],
+        ['csprclick:unsolicited_account_change', onUnsolicitedChange],
+        ['csprclick:provider-status-update', syncAccount]
+      ];
+      listeners.forEach(([name, listener]) => click.on(name, listener));
+      unsubscribe = () => listeners.forEach(([name, listener]) => click.off(name, listener));
+      syncAccount();
+      setSDK(click);
+    }).catch(error => {
+      if (!disposed) setSDKError(String(error.message || error));
+    });
     return () => {
-      clearTimeout(timer);
+      disposed = true;
+      unsubscribe();
     };
-  }, [counter]);
+  }, [log]);
 
-  const [activePublicKey, _setActivePublicKey] = useState<null | string>(() => {
-    const state: WalletStorageState | null = JSON.parse(
-      localStorage.getItem(WALLET_STORAGE_KEY) || 'null'
-    );
-    return state?.publicKey || null;
-  });
-
-  const setActivePublicKey = useCallback((key: string | null) => {
-    _setActivePublicKey(key);
-    localStorage.setItem(
-      WALLET_STORAGE_KEY,
-      JSON.stringify({
-        publicKey: key
-      } as WalletStorageState)
-    );
-  }, []);
-
-  // updated active publicKey when wallet unlocked
-  useEffect(() => {
-    getActivePublicKey()
-      .then(key => {
-        setActivePublicKey(key);
-        console.log(key);
-      })
-      .catch(err => {
-        if (err.code === 2) {
-          setActivePublicKey(null);
-        }
-        // no op
-      });
-  }, [extensionLoaded,setActivePublicKey]);
-
-  // WALLET SUBSCRIPTIONS
-  useEffect(() => {
-    if (extensionLoaded === false) {
-      return;
+  const getSDK = () => {
+    if (!sdk) throw new Error(sdkError || 'CSPR.click is still loading.');
+    return sdk;
+  };
+  const getSigningKey = (key: string) => {
+    const active = getSDK().getActiveAccount();
+    if (!active) throw new Error('Connect a wallet through CSPR.click first.');
+    if (active.public_key.toLowerCase() !== key.toLowerCase()) {
+      throw new Error('The signing key must match the active CSPR.click account. Switch accounts first.');
     }
-
-    const handleConnected = (event: any) => {
-      log('event:connected', event.detail);
-      try {
-        const action: CasperWalletState = JSON.parse(event.detail);
-        if (action.activeKey) {
-          setActivePublicKey(action.activeKey);
-        }
-      } catch (err) {
-        handleError(err);
-      }
-    };
-
-    const handleActiveKeyChanged = (event: any) => {
-      log('event:activeKeyChanged', event.detail);
-      try {
-        const state: CasperWalletState = JSON.parse(event.detail);
-        if (state.activeKey) {
-          setActivePublicKey(state.activeKey);
-        } else {
-          setActivePublicKey(null);
-        }
-      } catch (err) {
-        handleError(err);
-      }
-    };
-
-    const handleActiveKeySupportsChanged = (event: any) => {
-      log('event:ActiveKeySupportsChanged', event.detail);
-    };
-
-    const handleDisconnected = (event: any) => {
-      log('event:disconnected', event.detail);
-      try {
-        if (activePublicKey) {
-          setActivePublicKey(null);
-        }
-      } catch (err) {
-        handleError(err);
-      }
-    };
-
-    const handleTabChanged = (event: any) => {
-      log('event:tabChanged', event.detail);
-      try {
-        const action: CasperWalletState = JSON.parse(event.detail);
-        if (action.activeKey) {
-          setActivePublicKey(action.activeKey);
-        } else {
-          setActivePublicKey(null);
-        }
-      } catch (err) {
-        handleError(err);
-      }
-    };
-
-    const handleLocked = (event: any) => {
-      log('event:locked', event.detail);
-      try {
-        // const action: WalletState = JSON.parse(msg.detail);
-        // TODO: diplay locked label
-      } catch (err) {
-        handleError(err);
-      }
-    };
-
-    const handleUnlocked = (event: any) => {
-      log('event:unlocked', event.detail);
-      try {
-        const action: CasperWalletState = JSON.parse(event.detail);
-        if (action.activeKey) {
-          setActivePublicKey(action.activeKey);
-        } else {
-          setActivePublicKey(null);
-        }
-      } catch (err) {
-        handleError(err);
-      }
-    };
-
-    // subscribe to signer events
-    window.addEventListener(CasperWalletEventTypes.Connected, handleConnected);
-    window.addEventListener(
-      CasperWalletEventTypes.ActiveKeyChanged,
-      handleActiveKeyChanged
-    );
-    window.addEventListener(
-      CasperWalletEventTypes.ActiveKeySupportsChanged,
-      handleActiveKeySupportsChanged,
-    );
-    window.addEventListener(
-      CasperWalletEventTypes.Disconnected,
-      handleDisconnected
-    );
-    window.addEventListener(
-      CasperWalletEventTypes.TabChanged,
-      handleTabChanged
-    );
-    window.addEventListener(CasperWalletEventTypes.Locked, handleLocked);
-    window.addEventListener(CasperWalletEventTypes.Unlocked, handleUnlocked);
-
-    return () => {
-      window.removeEventListener(
-        CasperWalletEventTypes.Connected,
-        handleConnected
-      );
-      window.removeEventListener(
-        CasperWalletEventTypes.ActiveKeyChanged,
-        handleActiveKeyChanged
-      );
-      window.removeEventListener(
-        CasperWalletEventTypes.ActiveKeySupportsChanged,
-        handleActiveKeySupportsChanged
-      );
-      window.removeEventListener(
-        CasperWalletEventTypes.Disconnected,
-        handleDisconnected
-      );
-      window.removeEventListener(
-        CasperWalletEventTypes.TabChanged,
-        handleTabChanged
-      );
-      window.removeEventListener(CasperWalletEventTypes.Locked, handleLocked);
-      window.removeEventListener(
-        CasperWalletEventTypes.Unlocked,
-        handleUnlocked
-      );
-    };
-  }, [activePublicKey, setActivePublicKey, extensionLoaded]);
-
-  const connect = async () => {
-    return getCasperWalletInstance()
-      .requestConnection()
-      .then(res => log(`Connected response: ${res}`));
-  };
-
-  const switchAccount = () => {
-    return getCasperWalletInstance()
-      .requestSwitchAccount()
-      .then(res => log(`Switch response: ${res}`));
-  };
-
-  const sign = async (deployJson: string, accountPublicKey: string) => {
-    return getCasperWalletInstance().sign(deployJson, accountPublicKey);
-  };
-
-  const signMessage = async (message: string, accountPublicKey: string) => {
-    return getCasperWalletInstance().signMessage(message, accountPublicKey);
-  };
-
-  const signTypedData = async (
-    params: SignTypedDataParams,
-    accountPublicKey: string
-  ) => getCasperWalletInstance().signTypedData(params, accountPublicKey);
-
-  const decryptMessage = async (message: string, accountPublicKey: string) => {
-    return getCasperWalletInstance().decryptMessage(message, accountPublicKey);
-  };
-
-  const disconnect = () => {
-    setActivePublicKey(null);
-    return getCasperWalletInstance()
-      .disconnectFromSite()
-      .then(res => log(`Disconnected response: ${res}`));
-  };
-
-  const isSiteConnected = async () => {
-    return getCasperWalletInstance().isConnected();
-  };
-
-  const getActivePublicKey = async () => {
-    return getCasperWalletInstance().getActivePublicKey();
-  };
-
-  const encryptMessage = async (message: string, signingPublicKeyHex: string) => {
-    return getCasperWalletInstance().encryptMessage(message, signingPublicKeyHex);
-  };
-
-  const getActiveKeySupports = async () => {
-    return getCasperWalletInstance().getActivePublicKeySupports();
-  };
-
-  const getVersion = async () => {
-    return getCasperWalletInstance().getVersion();
+    return active.public_key.toLowerCase();
   };
 
   const contextProps: WalletService = {
     logs,
     log,
-    activePublicKey: activePublicKey,
-    connect: connect,
-    switchAccount: switchAccount,
-    sign: sign,
-    signMessage: signMessage,
-    signTypedData,
-    decryptMessage,
-    disconnect: disconnect,
-    isSiteConnected: isSiteConnected,
-    getActivePublicKey: getActivePublicKey,
-    encryptMessage,
-    getVersion: getVersion,
-    getActiveKeySupports
+    sdkReady: Boolean(sdk),
+    sdkError,
+    activePublicKey: account?.public_key.toLowerCase() || null,
+    activeProvider: account?.provider || null,
+    connect: async () => {
+      getSDK().signIn();
+      return true; // Opening the chooser; the signed_in event confirms connection.
+    },
+    switchAccount: async () => {
+      // Empty provider opens CSPR.click's chooser, including other providers.
+      await getSDK().switchAccount('');
+      return true;
+    },
+    disconnect: async () => {
+      const click = getSDK();
+      const active = click.getActiveAccount();
+      if (!active) return false;
+      await click.disconnect(active.provider);
+      setAccount(click.getActiveAccount() || null);
+      return true;
+    },
+    signOut: async () => {
+      getSDK().signOut();
+      setAccount(null);
+    },
+    sign: async (json, key) => normalizeSignResult(await getSDK().sign(json, getSigningKey(key))),
+    signMessage: async (message, key) => normalizeSignResult(await getSDK().signMessage(message, getSigningKey(key))),
+    signTypedData: async (params, key) => {
+      const result = await getSDK().signTypedData(params, getSigningKey(key));
+      return result ? { ...result, signature: result.signatureHex } : undefined;
+    },
+    encryptMessage: async (message, key) => {
+      const result = await getSDK().encryptMessage(message, getSigningKey(key));
+      if (result?.error) throw new Error(result.error);
+      if (result?.cancelled) throw new Error('Encryption cancelled.');
+      if (result?.encryptedMessage == null) throw new Error('CSPR.click returned no encrypted message.');
+      return { encryptedMessage: result.encryptedMessage };
+    },
+    decryptMessage: async (message, key) => {
+      const result = await getSDK().decryptMessage(message, getSigningKey(key));
+      if (result?.error) throw new Error(result.error);
+      if (result?.cancelled) return { cancelled: true };
+      if (result?.decryptedMessage == null) throw new Error('CSPR.click returned no decrypted message.');
+      return { cancelled: false, decryptedMessage: result.decryptedMessage };
+    },
+    isSiteConnected: async () => {
+      const click = getSDK();
+      const active = click.getActiveAccount();
+      return active ? Boolean(await click.isConnected(active.provider)) : false;
+    },
+    getActivePublicKey: async () => getSDK().getActiveAccount()?.public_key.toLowerCase(),
+    getActiveKeySupports: async () => (await getSDK().getProviderInfo())?.supports,
+    getVersion: async () => (await getSDK().getProviderVersion()) || 'Provider version unavailable'
   };
 
-  return <WalletServiceContextProvider value={contextProps} {...props} />;
+  return <WalletServiceContextProvider value={contextProps}>{children}</WalletServiceContextProvider>;
 };
-
-function handleError(err: unknown) {
-  console.log(err);
-}

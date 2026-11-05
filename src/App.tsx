@@ -59,6 +59,10 @@ const RowWrap = styled(Row)({
 function App() {
   const {
     logs,
+    sdkReady,
+    sdkError,
+    activeProvider,
+    signOut,
     activePublicKey,
     connect,
     disconnect,
@@ -214,8 +218,10 @@ function App() {
       });
   };
 
-  const handleConnect = () => connect();
-  const handleDisconnect = () => disconnect();
+  const runWalletAction = (action: () => Promise<unknown>) => () =>
+    action().catch(error => alert(error.message));
+  const handleConnect = runWalletAction(connect);
+  const handleDisconnect = runWalletAction(disconnect);
 
   const statusText = activePublicKey
     ? `${truncateKey(activePublicKey)}`
@@ -229,25 +235,33 @@ function App() {
     <Container>
       <LogoTitleContainer style={{ fontSize: '2rem' }}>
         <img src={logo} alt='logo' />
-        Casper Wallet Playground
+        Casper Wallet Playground · CSPR.click
       </LogoTitleContainer>
 
+      {!sdkReady && <p role={sdkError ? 'alert' : 'status'}>{sdkError || 'Loading CSPR.click…'}</p>}
       <RowWrap>
+        {activeProvider && <span>Provider: {activeProvider} · </span>}
         Connected Account: {statusText}{' '}
-        <Button variant='contained' onClick={handleConnect}>
+        <Button variant='contained' disabled={!sdkReady} onClick={handleConnect}>
           Connect
         </Button>
-        <Button variant='contained' onClick={handleDisconnect}>
-          Disconnect
+        <Button variant='contained' disabled={!sdkReady || !activePublicKey} onClick={handleDisconnect}>
+          Disconnect wallet
         </Button>
-        <Button variant='contained' onClick={switchAccount}>
+        <Button variant='contained' disabled={!sdkReady || !activePublicKey} onClick={runWalletAction(signOut)}>
+          Sign out
+        </Button>
+        <Button variant='contained' disabled={!sdkReady} onClick={runWalletAction(switchAccount)}>
           Switch
         </Button>
         <Button
           variant='contained'
           onClick={async () => {
-            const ver = await getVersion();
-            alert(ver);
+            try {
+              alert(await getVersion());
+            } catch (error: any) {
+              alert(error.message);
+            }
           }}
         >
           Show Version

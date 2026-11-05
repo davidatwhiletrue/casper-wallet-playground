@@ -4,7 +4,7 @@
 
 ## Introduction
 
-Casper Wallet Playground App is a sample project designed to help developers understand how to integrate [Casper Wallet](https://github.com/make-software/casper-wallet) with third-party web applications. This repository serves as a reference implementation and learning resource for developers interested in the Casper Network ecosystem.
+Casper Wallet Playground App is a sample project designed to help developers understand how to integrate [CSPR.click](https://docs.cspr.click) with third-party web applications, using Casper Wallet, Ledger, MetaMask Snap, or Google sign-in. This repository serves as a reference implementation and learning resource for developers interested in the Casper Network ecosystem.
 
 Please be aware that the app is only for development and testing, and not for direct usage in production environments, as the name suggests.
 
@@ -18,6 +18,41 @@ To set up the development environment, follow these steps:
 4. Install dependencies: `npm install`
 
 Once the setup is complete, refer to the [Available Scripts](#available-scripts) section to start, test, or build the project.
+
+## CSPR.click integration
+
+The wallet service loads the CSPR.click 2.2.0 UI bundle dynamically, following the
+`csprclick-x402` reference integration. SDK options are assigned before download;
+wallet methods are available only after `csprclick:loaded`. The UI container lives
+outside React's root so React does not remove SDK-managed elements.
+
+Click **Connect** to choose a provider. **Switch** opens the SDK account chooser,
+which also allows changing providers. **Sign out** ends the CSPR.click session;
+**Disconnect wallet** revokes the active provider's connection permission.
+Account changes and restored sessions come from CSPR.click, without a separate
+public-key cache in the playground.
+
+Deploy, Transaction V1, message, EIP-712, encryption and decryption scenarios all
+use the SDK. Provider capabilities vary; **Get Active Key Supports** reports the
+active provider's capabilities, and unsupported requests show the SDK error.
+Signing and encryption keys must match the active account. Scenarios specifying
+another key therefore fail at the SDK integration boundary. Transactions are
+signed for inspection only; these scenarios do not submit them to the network.
+
+Optional configuration in `.env.local` (restart the development server after edits):
+
+```dotenv
+REACT_APP_CSPRCLICK_APP_ID=csprclick-template
+# Optional service override for a development CSPR.click environment:
+# REACT_APP_CSPRCLICK_HOST=https://your-csprclick-host.example
+# Optional SDK bundle override (default matches csprclick-x402's RC UI bundle):
+# REACT_APP_CSPRCLICK_SCRIPT_URL=https://cdn.cspr.click/rc-ui/v2.2.0/csprclick-client-2.2.0.js
+```
+
+`csprclick-template` is for localhost development. Before deploying to a hosted
+environment, register an application at [CSPR.build](https://console.cspr.build)
+and set its application ID. The reference project's private development host is
+not required; the playground uses the SDK's default service unless overridden.
 
 ## Available Scripts
 
